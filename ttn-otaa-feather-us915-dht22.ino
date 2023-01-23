@@ -265,10 +265,22 @@ void do_send(osjob_t* j){
         lpp.addRelativeHumidity(1, rHumidity);
         Serial.print(F("Cayenne Packet Size: "));
         Serial.println(lpp.getSize());
-        LMIC_setTxData2(1, lpp.getBuffer(), lpp.getSize(), 0);
 
+        lmic_tx_error_t txDataError;
+        txDataError = LMIC_setTxData2(1, lpp.getBuffer(), lpp.getSize(), 0);
 
         Serial.println(F("Packet queued"));
+        if (txDataError == LMIC_ERROR_SUCCESS) {
+            Serial.println(F("Packet will be sent"));
+        } else if (txDataError == LMIC_ERROR_TX_BUSY) {
+            Serial.println(F("Packet not sent, LMIC busy sending other message"));
+        } else if (txDataError == LMIC_ERROR_TX_TOO_LARGE) {
+            Serial.println(F("Packet too large for current datarate"));
+        } else if (txDataError == LMIC_ERROR_TX_NOT_FEASIBLE) {
+            Serial.println(F("Packet unsuitable for current datarate"));
+        } else {
+            Serial.println(F("Queued message failed to send for other reason than data len"));
+        }
     }
     // Next TX is scheduled after TX_COMPLETE event.
 }
