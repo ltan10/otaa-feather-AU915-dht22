@@ -18,16 +18,24 @@
  *******************************************************************************/
 #include <arduino_lmic.h>
 #include <hal/hal.h>
+#include <RTCZero.h> // Arduino Zero Real Time Clock Library
 #include <SPI.h>
 #include <CayenneLPP.h>
+#include <DHT.h> // include the DHT22 Sensor Library
 
-// include the DHT22 Sensor Library
-#include "DHT.h"
+// Schedule TX every this many seconds (might become longer due to duty
+// cycle limitations).
+const unsigned TX_INTERVAL = 60; // 5 mins
 
 // DHT digital pin and sensor type
 #define DHTPIN 10
 #define DHTTYPE DHT22
 
+// LMIC Device State
+#define STATE_IDLE 0
+#define STATE_STANDBY_READY 1
+#define STATE_DO_JOB 2
+static uint8_t state = STATE_IDLE;
 // //
 // // For normal use, we require that you edit the sketch to replace FILLMEIN
 // // with values assigned by the TTN console. However, for regression tests,
@@ -63,10 +71,6 @@ void os_getDevKey (u1_t* buf) {  memcpy_P(buf, APPKEY, 16);}
 static uint8_t payload[5];
 static osjob_t sendjob;
 
-// Schedule TX every this many seconds (might become longer due to duty
-// cycle limitations).
-const unsigned TX_INTERVAL = 300; // 5 mins
-
 // Pin mapping for Adafruit Feather M0 LoRa
 // /!\ By default Adafruit Feather M0's pin 6 and DIO1 are not connected.
 // Please ensure they are connected.
@@ -80,6 +84,7 @@ const lmic_pinmap lmic_pins = {
     .spi_freq = 8000000,
 };
 
+
 // init. DHT
 DHT dht(DHTPIN, DHTTYPE);
 
@@ -87,11 +92,82 @@ DHT dht(DHTPIN, DHTTYPE);
 #define MAX_CAYENNE_PAYLOAD_SIZE 51
 CayenneLPP lpp(MAX_CAYENNE_PAYLOAD_SIZE);
 
+// Declare real time clock
+RTCZero rtc;
+
+uint32_t userUTCTime; // Seconds since the UTC epoch
+
+// Utility function for digital clock display: prints preceding colon and
+// leading 0
+void printDigits(int digits) {
+    Serial.print(':');
+    if (digits < 10) Serial.print('0');
+    Serial.print(digits);
+}
+
 void printHex2(unsigned v) {
     v &= 0xff;
     if (v < 16)
         Serial.print('0');
     Serial.print(v, HEX);
+}
+
+
+void user_request_network_time_callback(void *pVoidUserUTCTime, int flagSuccess) {
+    // Explicit conversion from void* to uint32_t* to avoid compiler errors
+    uint32_t *pUserUTCTime = (uint32_t *) pVoidUserUTCTime;
+
+    // A struct that will be populated by LMIC_getNetworkTimeReference.
+    // It contains the following fields:
+    //  - tLocal: the value returned by os_GetTime() when the time
+    //            request was sent to the gateway, and
+    //  - tNetwork: the seconds between the GPS epoch and the time
+    //              the gateway received the time request
+    lmic_time_reference_t lmicTimeReference;
+
+    if (flagSuccess != 1) {
+        Serial.println(F("USER CALLBACK: Not a success"));
+        return;
+    }
+
+    // Populate "lmic_time_reference"
+    flagSuccess = LMIC_getNetworkTimeReference(&lmicTimeReference);
+    if (flagSuccess != 1) {
+        Serial.println(F("USER CALLBACK: LMIC_getNetworkTimeReference didn't succeed"));
+        return;
+    }
+
+    // Update userUTCTime, considering the difference between the GPS and UTC
+    // epoch, and the leap seconds
+    *pUserUTCTime = lmicTimeReference.tNetwork + 315964800;
+
+    // Add the delay between the instant the time was transmitted and
+    // the current time
+
+    // Current time, in ticks
+    ostime_t ticksNow = os_getTime();
+    // Time when the request was sent, in ticks
+    ostime_t ticksRequestSent = lmicTimeReference.tLocal;
+    uint32_t requestDelaySec = osticks2ms(ticksNow - ticksRequestSent) / 1000;
+    *pUserUTCTime += requestDelaySec;
+
+    // Add time zone offset
+    *pUserUTCTime += (10*60*60);
+
+    // Update the system time with the time read from the network
+    rtc.setEpoch(*pUserUTCTime);
+
+    Serial.print(F("The current UTC time is: "));
+    Serial.print(rtc.getHours());
+    printDigits(rtc.getMinutes());
+    printDigits(rtc.getSeconds());
+    Serial.print(' ');
+    Serial.print(rtc.getDay());
+    Serial.print('/');
+    Serial.print(rtc.getMonth());
+    Serial.print('/');
+    Serial.print(rtc.getYear());
+    Serial.println();
 }
 
 void onEvent (ev_t ev) {
@@ -144,6 +220,7 @@ void onEvent (ev_t ev) {
             // during join, but because slow data rates change max TX
       // size, we don't use it in this example.
             LMIC_setLinkCheckMode(0);
+            state = STATE_DO_JOB;
             break;
         /*
         || This event is defined but not used in the code. No
@@ -170,7 +247,8 @@ void onEvent (ev_t ev) {
               Serial.println(F(" bytes of payload"));
             }
             // Schedule next transmission
-            os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);
+            // os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);
+            state = STATE_IDLE;
             break;
         case EV_LOST_TSYNC:
             Serial.println(F("EV_LOST_TSYNC"));
@@ -287,11 +365,13 @@ void do_send(osjob_t* j){
 
 void setup() {
     delay(5000);
+    pinMode(LED_BUILTIN, OUTPUT);
     while (! Serial);
-    Serial.begin(9600);
+    Serial.begin(115200);
     Serial.println(F("Starting"));
 
     dht.begin();
+    rtc.begin(false);
 
     // LMIC init
     os_init();
@@ -309,15 +389,55 @@ void setup() {
     // Define device as being powered by external power source
     LMIC_setBatteryLevel(MCMD_DEVS_EXT_POWER);
 
+    Serial.println(F("Joining"));
+    LMIC_startJoining();
     // Start job (sending automatically starts OTAA too)
-    do_send(&sendjob);
+    // Serial.println(F("Do First Job"));
+    // do_send(&sendjob);
+    LMIC_requestNetworkTime(user_request_network_time_callback, &userUTCTime);
 }
 
+bit_t have_deadline = 0;
+
 void loop() {
-  // we call the LMIC's runloop processor. This will cause things to happen based on events and time. One
-  // of the things that will happen is callbacks for transmission complete or received messages. We also
-  // use this loop to queue periodic data transmissions.  You can put other things here in the `loop()` routine,
-  // but beware that LoRaWAN timing is pretty tight, so if you do more than a few milliseconds of work, you
-  // will want to call `os_runloop_once()` every so often, to keep the radio running.
-  os_runloop_once();
+    // we call the LMIC's runloop processor. This will cause things to happen based on events and time. One
+    // of the things that will happen is callbacks for transmission complete or received messages. We also
+    // use this loop to queue periodic data transmissions.  You can put other things here in the `loop()` routine,
+    // but beware that LoRaWAN timing is pretty tight, so if you do more than a few milliseconds of work, you
+    // will want to call `os_runloop_once()` every so often, to keep the radio running.
+    os_runloop_once();
+
+    // Let radio do its thing before consider doing anything else.
+    if (!(LMIC.opmode & OP_TXRXPEND)) {
+        switch (state) {
+            case STATE_DO_JOB:
+                Serial.println(F("State: Do_JOB"));
+                os_setCallback(&sendjob, do_send);
+                // State update in radio_onevent
+                state = STATE_IDLE;
+                break;
+            case STATE_STANDBY_READY:
+                Serial.println(F("State: STANDBY_READY"));
+                // os_getNextDeadline(&have_deadline);
+                // if (have_deadline) {
+                //     // Serial.print("Deadline: ");
+                //     // Serial.print(have_deadline);
+                //     // Serial.print(" in ");
+                //     // Serial.println(" deadline");
+                //     state = STATE_IDLE;
+                // } else {
+                    // Serial.println(F("Going into standby"));
+                    delay(TX_INTERVAL*1000);
+                    state = STATE_DO_JOB;
+                // }
+                break;
+            case STATE_IDLE:
+                have_deadline = os_queryTimeCriticalJobs(sec2osticks(TX_INTERVAL));
+                // os_getNextDeadline(&have_deadline);
+                if (!have_deadline) {
+                    state = STATE_STANDBY_READY;
+                }
+                break;
+        }
+    }
 }
