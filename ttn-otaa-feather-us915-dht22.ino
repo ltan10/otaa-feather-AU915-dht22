@@ -23,9 +23,11 @@
 #include <CayenneLPP.h>
 #include <DHT.h> // include the DHT22 Sensor Library
 
+#define serial Serial1
+
 // Schedule TX every this many seconds (might become longer due to duty
 // cycle limitations).
-const unsigned TX_INTERVAL = 60; // 5 mins
+const unsigned TX_INTERVAL = 120; // 5 mins
 
 // DHT digital pin and sensor type
 #define DHTPIN 10
@@ -67,6 +69,7 @@ void os_getDevEui (u1_t* buf) { memcpy_P(buf, DEVEUI, 8);}
 static const u1_t PROGMEM APPKEY[16] = { 0x75, 0x91, 0x12, 0xf7, 0xce, 0xd1, 0x23, 0x82, 0x1a, 0x06, 0xdb, 0x51, 0x2a, 0x90, 0x92, 0xd2 };
 void os_getDevKey (u1_t* buf) {  memcpy_P(buf, APPKEY, 16);}
 
+
 // payload to send to TTN gateway
 static uint8_t payload[5];
 static osjob_t sendjob;
@@ -100,16 +103,87 @@ uint32_t userUTCTime; // Seconds since the UTC epoch
 // Utility function for digital clock display: prints preceding colon and
 // leading 0
 void printDigits(int digits) {
-    Serial.print(':');
-    if (digits < 10) Serial.print('0');
-    Serial.print(digits);
+    serial.print(':');
+    if (digits < 10) serial.print('0');
+    serial.print(digits);
 }
 
 void printHex2(unsigned v) {
     v &= 0xff;
     if (v < 16)
-        Serial.print('0');
-    Serial.print(v, HEX);
+        serial.print('0');
+    serial.print(v, HEX);
+}
+
+// A buffer for printing log messages.
+static constexpr int MAX_MSG = 256;
+static char msg[MAX_MSG];
+
+// A printf-like function to print log messages prefixed by the current
+// LMIC tick value. Don't call it before os_init();
+//
+// The RTC timestamps will start at 00:00:00, but will update to UTC
+// if the DeviceTimeReq is answered.
+void log_msg(const char *fmt, ...) {
+#ifdef USE_SERIAL
+    snprintf(msg, MAX_MSG, "%02d:%02d:%02d / ", rtc.getHours(), rtc.getMinutes(), rtc.getSeconds());
+    serial.write(msg, strlen(msg));
+    snprintf(msg, MAX_MSG, "% 012ld: ", os_getTime());
+    serial.write(msg, strlen(msg));
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(msg, MAX_MSG, fmt, args);
+    va_end(args);
+    serial.write(msg, strlen(msg));
+    serial.println();
+#endif
+}
+
+/*
+ * This function is used to set the alarm to a relative time in the future, such as when
+ * sleeping between LMIC tasks.
+ */
+void set_delta_alarm(uint32_t delta_seconds) {
+    int32_t ss = (int32_t)rtc.getSeconds();
+    int32_t mm = (int32_t)rtc.getMinutes();
+    int32_t hh = (int32_t)rtc.getHours();
+
+    // Sanity check.
+    if (delta_seconds < 1) {
+        delta_seconds = 1;
+    }
+
+    int32_t delta = delta_seconds;
+    int32_t hh_delta = delta / 3600; delta -= (hh_delta * 3600);
+    // Will always be less than 1 hour.
+    int32_t mm_delta = delta / 60; delta -= (mm_delta * 60);
+    // Will always be less than 1 minute.
+    int32_t ss_delta = delta;
+
+    ss += ss_delta;
+    if (ss > 59) {
+        ss = ss % 60;
+        mm_delta++;
+    }
+
+    mm += mm_delta;
+    if (mm > 59) {
+        mm = mm % 60;
+        hh_delta++;
+    }
+
+    hh = (hh + hh_delta) % 24;
+
+    serial.print("Delta(s) = ");
+    serial.print(delta_seconds);
+    serial.print(F(", wake at "));
+    serial.print(hh);
+    printDigits(mm);
+    printDigits(ss);
+    serial.println();
+
+    rtc.setAlarmTime((uint8_t)(hh & 0xff), (uint8_t)(mm & 0xff), (uint8_t)(ss & 0xff));
+    rtc.enableAlarm(RTCZero::MATCH_HHMMSS);
 }
 
 
@@ -126,14 +200,14 @@ void user_request_network_time_callback(void *pVoidUserUTCTime, int flagSuccess)
     lmic_time_reference_t lmicTimeReference;
 
     if (flagSuccess != 1) {
-        Serial.println(F("USER CALLBACK: Not a success"));
+        serial.println(F("USER CALLBACK: Not a success"));
         return;
     }
 
     // Populate "lmic_time_reference"
     flagSuccess = LMIC_getNetworkTimeReference(&lmicTimeReference);
     if (flagSuccess != 1) {
-        Serial.println(F("USER CALLBACK: LMIC_getNetworkTimeReference didn't succeed"));
+        serial.println(F("USER CALLBACK: LMIC_getNetworkTimeReference didn't succeed"));
         return;
     }
 
@@ -157,64 +231,64 @@ void user_request_network_time_callback(void *pVoidUserUTCTime, int flagSuccess)
     // Update the system time with the time read from the network
     rtc.setEpoch(*pUserUTCTime);
 
-    Serial.print(F("The current UTC time is: "));
-    Serial.print(rtc.getHours());
+    serial.print(F("The current UTC time is: "));
+    serial.print(rtc.getHours());
     printDigits(rtc.getMinutes());
     printDigits(rtc.getSeconds());
-    Serial.print(' ');
-    Serial.print(rtc.getDay());
-    Serial.print('/');
-    Serial.print(rtc.getMonth());
-    Serial.print('/');
-    Serial.print(rtc.getYear());
-    Serial.println();
+    serial.print(' ');
+    serial.print(rtc.getDay());
+    serial.print('/');
+    serial.print(rtc.getMonth());
+    serial.print('/');
+    serial.print(rtc.getYear());
+    serial.println();
 }
 
 void onEvent (ev_t ev) {
-    Serial.print(os_getTime());
-    Serial.print(": ");
+    serial.print(os_getTime());
+    serial.print(": ");
     switch(ev) {
         case EV_SCAN_TIMEOUT:
-            Serial.println(F("EV_SCAN_TIMEOUT"));
+            serial.println(F("EV_SCAN_TIMEOUT"));
             break;
         case EV_BEACON_FOUND:
-            Serial.println(F("EV_BEACON_FOUND"));
+            serial.println(F("EV_BEACON_FOUND"));
             break;
         case EV_BEACON_MISSED:
-            Serial.println(F("EV_BEACON_MISSED"));
+            serial.println(F("EV_BEACON_MISSED"));
             break;
         case EV_BEACON_TRACKED:
-            Serial.println(F("EV_BEACON_TRACKED"));
+            serial.println(F("EV_BEACON_TRACKED"));
             break;
         case EV_JOINING:
-            Serial.println(F("EV_JOINING"));
+            serial.println(F("EV_JOINING"));
             break;
         case EV_JOINED:
-            Serial.println(F("EV_JOINED"));
+            serial.println(F("EV_JOINED"));
             {
               u4_t netid = 0;
               devaddr_t devaddr = 0;
               u1_t nwkKey[16];
               u1_t artKey[16];
               LMIC_getSessionKeys(&netid, &devaddr, nwkKey, artKey);
-              Serial.print("netid: ");
-              Serial.println(netid, DEC);
-              Serial.print("devaddr: ");
-              Serial.println(devaddr, HEX);
-              Serial.print("AppSKey: ");
+              serial.print("netid: ");
+              serial.println(netid, DEC);
+              serial.print("devaddr: ");
+              serial.println(devaddr, HEX);
+              serial.print("AppSKey: ");
               for (size_t i=0; i<sizeof(artKey); ++i) {
                 if (i != 0)
-                  Serial.print("-");
+                  serial.print("-");
                 printHex2(artKey[i]);
               }
-              Serial.println("");
-              Serial.print("NwkSKey: ");
+              serial.println("");
+              serial.print("NwkSKey: ");
               for (size_t i=0; i<sizeof(nwkKey); ++i) {
                       if (i != 0)
-                              Serial.print("-");
+                              serial.print("-");
                       printHex2(nwkKey[i]);
               }
-              Serial.println();
+              serial.println();
             }
             // Disable link check validation (automatically enabled
             // during join, but because slow data rates change max TX
@@ -227,69 +301,69 @@ void onEvent (ev_t ev) {
         || point in wasting codespace on it.
         ||
         || case EV_RFU1:
-        ||     Serial.println(F("EV_RFU1"));
+        ||     serial.println(F("EV_RFU1"));
         ||     break;
         */
         case EV_JOIN_FAILED:
-            Serial.println(F("EV_JOIN_FAILED"));
+            serial.println(F("EV_JOIN_FAILED"));
             break;
         case EV_REJOIN_FAILED:
-            Serial.println(F("EV_REJOIN_FAILED"));
+            serial.println(F("EV_REJOIN_FAILED"));
             break;
             break;
         case EV_TXCOMPLETE:
-            Serial.println(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
+            serial.println(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
             if (LMIC.txrxFlags & TXRX_ACK)
-              Serial.println(F("Received ack"));
+              serial.println(F("Received ack"));
             if (LMIC.dataLen) {
-              Serial.println(F("Received "));
-              Serial.println(LMIC.dataLen);
-              Serial.println(F(" bytes of payload"));
+              serial.println(F("Received "));
+              serial.println(LMIC.dataLen);
+              serial.println(F(" bytes of payload"));
             }
             // Schedule next transmission
             // os_setTimedCallback(&sendjob, os_getTime()+sec2osticks(TX_INTERVAL), do_send);
             state = STATE_IDLE;
             break;
         case EV_LOST_TSYNC:
-            Serial.println(F("EV_LOST_TSYNC"));
+            serial.println(F("EV_LOST_TSYNC"));
             break;
         case EV_RESET:
-            Serial.println(F("EV_RESET"));
+            serial.println(F("EV_RESET"));
             break;
         case EV_RXCOMPLETE:
             // data received in ping slot
-            Serial.println(F("EV_RXCOMPLETE"));
+            serial.println(F("EV_RXCOMPLETE"));
             break;
         case EV_LINK_DEAD:
-            Serial.println(F("EV_LINK_DEAD"));
+            serial.println(F("EV_LINK_DEAD"));
             break;
         case EV_LINK_ALIVE:
-            Serial.println(F("EV_LINK_ALIVE"));
+            serial.println(F("EV_LINK_ALIVE"));
             break;
         /*
         || This event is defined but not used in the code. No
         || point in wasting codespace on it.
         ||
         || case EV_SCAN_FOUND:
-        ||    Serial.println(F("EV_SCAN_FOUND"));
+        ||    serial.println(F("EV_SCAN_FOUND"));
         ||    break;
         */
         case EV_TXSTART:
-            Serial.println(F("EV_TXSTART"));
+            serial.println(F("EV_TXSTART"));
             break;
         case EV_TXCANCELED:
-            Serial.println(F("EV_TXCANCELED"));
+            serial.println(F("EV_TXCANCELED"));
             break;
         case EV_RXSTART:
             /* do not print anything -- it wrecks timing */
             break;
         case EV_JOIN_TXCOMPLETE:
-            Serial.println(F("EV_JOIN_TXCOMPLETE: no JoinAccept"));
+            serial.println(F("EV_JOIN_TXCOMPLETE: no JoinAccept"));
             break;
 
         default:
-            Serial.print(F("Unknown event: "));
-            Serial.println((unsigned) ev);
+            serial.print(F("Unknown event: "));
+            serial.println((unsigned) ev);
             break;
     }
 }
@@ -297,19 +371,19 @@ void onEvent (ev_t ev) {
 void do_send(osjob_t* j){
     // Check if there is not a current TX/RX job running
     if (LMIC.opmode & OP_TXRXPEND) {
-        Serial.println(F("OP_TXRXPEND, not sending"));
+        serial.println(F("OP_TXRXPEND, not sending"));
     } else {
         // read the temperature from the DHT22
         float temperature = dht.readTemperature();
-        Serial.print("Temperature: "); Serial.print(temperature);
-        Serial.println(" *C");
+        serial.print("Temperature: "); serial.print(temperature);
+        serial.println(" *C");
         // adjust for the f2sflt16 range (-1 to 1)
         // temperature = temperature / 100;
 
         // read the humidity from the DHT22
         float rHumidity = dht.readHumidity();
-        Serial.print("%RH ");
-        Serial.println(rHumidity);
+        serial.print("%RH ");
+        serial.println(rHumidity);
         // adjust for the f2sflt16 range (-1 to 1)
         // rHumidity = rHumidity / 100;
 
@@ -341,23 +415,23 @@ void do_send(osjob_t* j){
         lpp.reset();
         lpp.addTemperature(1, temperature);
         lpp.addRelativeHumidity(1, rHumidity);
-        Serial.print(F("Cayenne Packet Size: "));
-        Serial.println(lpp.getSize());
+        serial.print(F("Cayenne Packet Size: "));
+        serial.println(lpp.getSize());
 
         lmic_tx_error_t txDataError;
         txDataError = LMIC_setTxData2(1, lpp.getBuffer(), lpp.getSize(), 0);
 
-        Serial.println(F("Packet queued"));
+        serial.println(F("Packet queued"));
         if (txDataError == LMIC_ERROR_SUCCESS) {
-            Serial.println(F("Packet will be sent"));
+            serial.println(F("Packet will be sent"));
         } else if (txDataError == LMIC_ERROR_TX_BUSY) {
-            Serial.println(F("Packet not sent, LMIC busy sending other message"));
+            serial.println(F("Packet not sent, LMIC busy sending other message"));
         } else if (txDataError == LMIC_ERROR_TX_TOO_LARGE) {
-            Serial.println(F("Packet too large for current datarate"));
+            serial.println(F("Packet too large for current datarate"));
         } else if (txDataError == LMIC_ERROR_TX_NOT_FEASIBLE) {
-            Serial.println(F("Packet unsuitable for current datarate"));
+            serial.println(F("Packet unsuitable for current datarate"));
         } else {
-            Serial.println(F("Queued message failed to send for other reason than data len"));
+            serial.println(F("Queued message failed to send for other reason than data len"));
         }
     }
     // Next TX is scheduled after TX_COMPLETE event.
@@ -366,9 +440,9 @@ void do_send(osjob_t* j){
 void setup() {
     delay(5000);
     pinMode(LED_BUILTIN, OUTPUT);
-    while (! Serial);
-    Serial.begin(115200);
-    Serial.println(F("Starting"));
+    serial.begin(115200);
+    while (!serial);
+    serial.println(F("Starting"));
 
     dht.begin();
     rtc.begin(false);
@@ -389,10 +463,10 @@ void setup() {
     // Define device as being powered by external power source
     LMIC_setBatteryLevel(MCMD_DEVS_EXT_POWER);
 
-    Serial.println(F("Joining"));
+    serial.println(F("Joining"));
     LMIC_startJoining();
     // Start job (sending automatically starts OTAA too)
-    // Serial.println(F("Do First Job"));
+    // serial.println(F("Do First Job"));
     // do_send(&sendjob);
     LMIC_requestNetworkTime(user_request_network_time_callback, &userUTCTime);
 }
@@ -411,25 +485,25 @@ void loop() {
     if (!(LMIC.opmode & OP_TXRXPEND)) {
         switch (state) {
             case STATE_DO_JOB:
-                Serial.println(F("State: Do_JOB"));
+                digitalWrite(LED_BUILTIN, HIGH);
+                serial.println(F("State: Do_JOB"));
                 os_setCallback(&sendjob, do_send);
                 // State update in radio_onevent
                 state = STATE_IDLE;
                 break;
             case STATE_STANDBY_READY:
-                Serial.println(F("State: STANDBY_READY"));
-                // os_getNextDeadline(&have_deadline);
-                // if (have_deadline) {
-                //     // Serial.print("Deadline: ");
-                //     // Serial.print(have_deadline);
-                //     // Serial.print(" in ");
-                //     // Serial.println(" deadline");
-                //     state = STATE_IDLE;
-                // } else {
-                    // Serial.println(F("Going into standby"));
-                    delay(TX_INTERVAL*1000);
-                    state = STATE_DO_JOB;
-                // }
+                digitalWrite(LED_BUILTIN, LOW);
+                serial.println(F("State: STANDBY_READY"));
+                set_delta_alarm(TX_INTERVAL);
+                // delay(TX_INTERVAL*1000);
+                serial.flush();
+                rtc.standbyMode();
+
+                // Disable the alarm in case it was set to some short interval and LMIC
+                // tasks will run for longer than that. It probably wouldn't cause
+                // trouble but may as well be sure.
+                rtc.disableAlarm();
+                state = STATE_DO_JOB;
                 break;
             case STATE_IDLE:
                 have_deadline = os_queryTimeCriticalJobs(sec2osticks(TX_INTERVAL));
