@@ -22,12 +22,16 @@
 #include <SPI.h>
 #include <CayenneLPP.h>
 #include <DHT.h> // include the DHT22 Sensor Library
+#include <SDI12.h> // Include SDI-12 master
+
+#define DATA_PIN 11         /*!< The pin of the SDI-12 data bus */
+#define SENSOR_ADDRESS 0
 
 #define serial Serial1
 
 // Schedule TX every this many seconds (might become longer due to duty
 // cycle limitations).
-const unsigned TX_INTERVAL = 120; // 5 mins
+const unsigned TX_INTERVAL = 120; // 30 mins
 
 // DHT digital pin and sensor type
 #define DHTPIN 10
@@ -99,6 +103,9 @@ CayenneLPP lpp(MAX_CAYENNE_PAYLOAD_SIZE);
 RTCZero rtc;
 
 uint32_t userUTCTime; // Seconds since the UTC epoch
+
+/** Define the SDI-12 bus */
+SDI12 mySDI12(DATA_PIN);
 
 // Utility function for digital clock display: prints preceding colon and
 // leading 0
@@ -213,7 +220,7 @@ void user_request_network_time_callback(void *pVoidUserUTCTime, int flagSuccess)
 
     // Update userUTCTime, considering the difference between the GPS and UTC
     // epoch, and the leap seconds
-    *pUserUTCTime = lmicTimeReference.tNetwork + 315964800;
+    *pUserUTCTime = lmicTimeReference.tNetwork + 315964800 - 18;
 
     // Add the delay between the instant the time was transmitted and
     // the current time
@@ -231,7 +238,7 @@ void user_request_network_time_callback(void *pVoidUserUTCTime, int flagSuccess)
     // Update the system time with the time read from the network
     rtc.setEpoch(*pUserUTCTime);
 
-    serial.print(F("The current UTC time is: "));
+    serial.print(F("The current UTC+10 time is: "));
     serial.print(rtc.getHours());
     printDigits(rtc.getMinutes());
     printDigits(rtc.getSeconds());
@@ -368,6 +375,96 @@ void onEvent (ev_t ev) {
     }
 }
 
+bool getResults(char i, int resultsExpected) {
+  uint8_t resultsReceived = 0;
+  uint8_t cmd_number      = 0;
+  while (resultsReceived < resultsExpected && cmd_number <= 9) {
+    String command = "";
+    // in this example we will only take the 'DO' measurement
+    command = "";
+    command += i;
+    command += "D";
+    command += cmd_number;
+    command += "!";  // SDI-12 command to get data [address][D][dataOption][!]
+    mySDI12.sendCommand(command);
+
+    uint32_t start = millis();
+    while (mySDI12.available() < 3 && (millis() - start) < 1500) {}
+    mySDI12.read();           // ignore the repeated SDI12 address
+    char c = mySDI12.peek();  // check if there's a '+' and toss if so
+    if (c == '+') { mySDI12.read(); }
+
+    while (mySDI12.available()) {
+      char c = mySDI12.peek();
+      if (c == '-' || (c >= '0' && c <= '9') || c == '.') {
+        float result = mySDI12.parseFloat(SKIP_NONE);
+        serial.print(String(result, 10));
+        if (result != -9999) { resultsReceived++; }
+      } else if (c == '+') {
+        mySDI12.read();
+        serial.print(", ");
+      } else {
+        mySDI12.read();
+      }
+      delay(10);  // 1 character ~ 7.5ms
+    }
+    if (resultsReceived < resultsExpected) { serial.print(", "); }
+    cmd_number++;
+  }
+  mySDI12.clearBuffer();
+
+  return resultsReceived == resultsExpected;
+}
+
+bool takeMeasurement(char i, String meas_type = "") {
+  mySDI12.clearBuffer();
+  String command = "";
+  command += i;
+  command += "M";
+  command += meas_type;
+  command += "!";  // SDI-12 measurement command format  [address]['M'][!]
+  mySDI12.sendCommand(command);
+  delay(100);
+
+  // wait for acknowlegement with format [address][ttt (3 char, seconds)][number of
+  // measurments available, 0-9]
+  String sdiResponse = mySDI12.readStringUntil('\n');
+  sdiResponse.trim();
+
+  String addr = sdiResponse.substring(0, 1);
+  serial.print(addr);
+  serial.print(", ");
+
+  // find out how long we have to wait (in seconds).
+  uint8_t wait = sdiResponse.substring(1, 4).toInt();
+  serial.print(wait);
+  serial.print(", ");
+
+  // Set up the number of results to expect
+  int numResults = sdiResponse.substring(4).toInt();
+  serial.print(numResults);
+  serial.print(", ");
+
+  unsigned long timerStart = millis();
+  while ((millis() - timerStart) < (1000 * (wait + 1))) {
+    if (mySDI12.available())  // sensor can interrupt us to let us know it is done early
+    {
+      serial.print(millis() - timerStart);
+      serial.print(", ");
+      mySDI12.clearBuffer();
+      break;
+    }
+  }
+  // Wait for anything else and clear it out
+  delay(30);
+  mySDI12.clearBuffer();
+
+  if (numResults > 0) { return getResults(i, numResults); }
+
+  return true;
+}
+
+
 void do_send(osjob_t* j){
     // Check if there is not a current TX/RX job running
     if (LMIC.opmode & OP_TXRXPEND) {
@@ -405,6 +502,83 @@ void do_send(osjob_t* j){
         // payload[2] = humidLow;
         // payload[3] = humidHigh;
 
+        // Read SDI-12 Sensor
+        float sdi_data[2];
+        String myCommand   = "";
+        // first command to take a measurement
+        myCommand = String(SENSOR_ADDRESS) + "M!";
+        serial.println(myCommand);  // echo command to terminal
+        mySDI12.clearBuffer();
+        mySDI12.sendCommand(myCommand);
+        delay(100);
+
+        // wait for acknowlegement with format [address][ttt (3 char, seconds)][number of
+        // measurments available, 0-9]
+        String sdiResponse = mySDI12.readStringUntil('\n');
+        sdiResponse.trim();
+        serial.println(sdiResponse);
+
+        // find out how long we have to wait (in seconds).
+        uint8_t wait = sdiResponse.substring(1, 4).toInt();
+        // Set up the number of results to expect
+        int numResults = sdiResponse.substring(4).toInt();
+
+        unsigned long timerStart = millis();
+        while ((millis() - timerStart) < (1000UL * (wait + 1))) {
+            // sensor can interrupt us to let us know it is done early
+            if (mySDI12.available()) {
+                serial.print(millis() - timerStart);
+                serial.print(", ");
+                mySDI12.clearBuffer();
+                break;
+            }
+        }
+        // Wait for anything else and clear it out
+        delay(30);
+        mySDI12.clearBuffer();
+
+        // Send Get Results
+        uint8_t resultsReceived = 0;
+        uint8_t cmd_number      = 0;
+        myCommand = String(SENSOR_ADDRESS) + "D0!";
+
+        while (resultsReceived < numResults && cmd_number <= 9) {
+            myCommand = "0"; // Address
+            // in this example we will only take the 'DO' measurement
+            myCommand += "D";
+            myCommand += cmd_number;
+            myCommand += "!";  // SDI-12 command to get data [address][D][dataOption][!]
+            serial.println(myCommand);
+            mySDI12.sendCommand(myCommand);
+
+            uint32_t start = millis();
+            while (mySDI12.available() < 3 && (millis() - start) < 1500) {}
+            mySDI12.read();           // ignore the repeated SDI12 address
+            char c = mySDI12.peek();  // check if there's a '+' and toss if so
+            if (c == '+') { mySDI12.read(); }
+
+            while (mySDI12.available()) {
+            char c = mySDI12.peek();
+            if (c == '-' || (c >= '0' && c <= '9') || c == '.') {
+                float result = mySDI12.parseFloat(SKIP_NONE);
+                sdi_data[resultsReceived] = result;
+                serial.print(String(result, 10));
+                if (result != -9999) { resultsReceived++; }
+            } else if (c == '+') {
+                mySDI12.read();
+                serial.print(", ");
+            } else {
+                mySDI12.read();
+            }
+            delay(10);  // 1 character ~ 7.5ms
+            }
+            if (resultsReceived < numResults) { serial.print(", "); }
+            cmd_number++;
+        }
+        mySDI12.clearBuffer();
+
+        serial.println("");
+
         // prepare upstream data transmission at the next possible time.
         // transmit on port 1 (the first parameter); you can use any value from 1 to 223 (others are reserved).
         // don't request an ack (the last parameter, if not zero, requests an ack from the network).
@@ -415,6 +589,9 @@ void do_send(osjob_t* j){
         lpp.reset();
         lpp.addTemperature(1, temperature);
         lpp.addRelativeHumidity(1, rHumidity);
+
+        lpp.addBarometricPressure(2, sdi_data[0]*10);
+        lpp.addTemperature(2, sdi_data[1]);
         serial.print(F("Cayenne Packet Size: "));
         serial.println(lpp.getSize());
 
@@ -441,11 +618,13 @@ void setup() {
     delay(5000);
     pinMode(LED_BUILTIN, OUTPUT);
     serial.begin(115200);
-    while (!serial);
+    // while (!serial);
     serial.println(F("Starting"));
 
     dht.begin();
     rtc.begin(false);
+    mySDI12.begin();
+    delay(500);
 
     // LMIC init
     os_init();
