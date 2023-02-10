@@ -24,6 +24,12 @@
 #include <DHT.h> // include the DHT22 Sensor Library
 #include <SDI12.h> // Include SDI-12 master
 
+#define ENABLE_LED 1 // Enable Led to show when awake
+
+#define POWER_PIN_DHT 12
+#define POWER_PIN_9V 9
+#define BATTERY_ADC_PIN A1
+
 #define DATA_PIN 11         /*!< The pin of the SDI-12 data bus */
 #define SENSOR_ADDRESS 0
 
@@ -31,7 +37,7 @@
 
 // Schedule TX every this many seconds (might become longer due to duty
 // cycle limitations).
-const unsigned TX_INTERVAL = 120; // 30 mins
+const unsigned TX_INTERVAL = 1800; // 30 mins (30*60=1800)
 
 // DHT digital pin and sensor type
 #define DHTPIN 10
@@ -470,6 +476,13 @@ void do_send(osjob_t* j){
     if (LMIC.opmode & OP_TXRXPEND) {
         serial.println(F("OP_TXRXPEND, not sending"));
     } else {
+        if (POWER_PIN_9V > 1) {
+            digitalWrite(POWER_PIN_9V, HIGH);
+        }
+        if (POWER_PIN_DHT > 1) {
+            digitalWrite(POWER_PIN_DHT, HIGH);
+            delay(1000);
+        }
         // read the temperature from the DHT22
         float temperature = dht.readTemperature();
         serial.print("Temperature: "); serial.print(temperature);
@@ -481,6 +494,10 @@ void do_send(osjob_t* j){
         float rHumidity = dht.readHumidity();
         serial.print("%RH ");
         serial.println(rHumidity);
+
+        if (POWER_PIN_DHT > 1) {
+            digitalWrite(POWER_PIN_DHT, LOW);
+        }
         // adjust for the f2sflt16 range (-1 to 1)
         // rHumidity = rHumidity / 100;
 
@@ -501,6 +518,12 @@ void do_send(osjob_t* j){
         // byte humidHigh = highByte(payloadHumid);
         // payload[2] = humidLow;
         // payload[3] = humidHigh;
+        uint8_t batt_val;
+
+        if (POWER_PIN_9V > 1) {
+            batt_val = map(analogRead(BATTERY_ADC_PIN), 0, 1023, 1, 255);
+            delay(2000);
+        }
 
         // Read SDI-12 Sensor
         float sdi_data[2];
@@ -575,7 +598,11 @@ void do_send(osjob_t* j){
             if (resultsReceived < numResults) { serial.print(", "); }
             cmd_number++;
         }
+        if (POWER_PIN_9V > 1) {
+            digitalWrite(POWER_PIN_9V, LOW);
+        }
         mySDI12.clearBuffer();
+        LMIC_setBatteryLevel(batt_val);
 
         serial.println("");
 
@@ -590,7 +617,7 @@ void do_send(osjob_t* j){
         lpp.addTemperature(1, temperature);
         lpp.addRelativeHumidity(1, rHumidity);
 
-        lpp.addBarometricPressure(2, sdi_data[0]*10);
+        lpp.addBarometricPressure(2, sdi_data[0]*10000);
         lpp.addTemperature(2, sdi_data[1]);
         serial.print(F("Cayenne Packet Size: "));
         serial.println(lpp.getSize());
@@ -617,6 +644,8 @@ void do_send(osjob_t* j){
 void setup() {
     delay(5000);
     pinMode(LED_BUILTIN, OUTPUT);
+    pinMode(POWER_PIN_DHT, OUTPUT);
+    pinMode(POWER_PIN_9V, OUTPUT);
     serial.begin(115200);
     // while (!serial);
     serial.println(F("Starting"));
